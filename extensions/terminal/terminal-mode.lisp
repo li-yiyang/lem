@@ -1,209 +1,279 @@
-(uiop:define-package :lem-terminal/terminal-mode
+;;;; terminal-mode.lisp --- Terminal mode for Lem on 3bst
+
+;;; Commentary:
+;; This file is based on original lem-terminal (#0bfb210a), but
+;; replaced the terminal implementation with 3bst.
+;;
+;; The overall design is described as below:
+;;
+;;                          toggle
+;;                        copy-mode-p
+;;        terminal-mode <-------------> terminal-copy-mode
+;;  
+;;                   / term:   3bst:term          => used to processing rendering
+;;         terminal +- proc:   uiop:process-info  => used to hold the terminal process
+;;                   \ thread: bt:thread          => used to render terminal to buffer
+;;
+;;    Methods:
+;;    + (destroy buffer): terminate proc, close thread
+;;    + (attach-terminal  buffer): attach buffer with terminal
+;;    + (buffer-terminal-alive-p buffer): test if buffer has a living terminal
+;;    + (buffer-terminal buffer): get the terminal of the buffer
+;;
+;;    Commands:
+;;    + terminal-input: send the key sequence to terminal
+;;    + terminal-key-{...}: send the key press to terminal
+;; 
+;;  copy-mode-p                           => t or nil
+;;                                           if copy-mode-p is true, not update buffer terminal rendering 
+
+(defpackage #:lem-terminal/terminal-mode
   (:use :cl :lem)
-  (:local-nicknames (:ffi :lem-terminal/ffi))
-  (:local-nicknames (:terminal :lem-terminal/terminal)))
+  (:import-from :alexandria
+   #:when-let)
+  (:export 
+   #:*shell*
+   #:*new-terminal-behavior*
+   #:*terminal-buffer-name*
+   #:terminal
+   #:terminal-resize
+   #:buffer-terminal
+   #:terminal-proc))
+
 (in-package :lem-terminal/terminal-mode)
 
-;; FIXME: Think of a better name
-(defvar *bypass-commands*
-  '(next-window
-    previous-window
-    window-move-up
-    window-move-down
-    window-move-left
-    window-move-right
-    split-active-window-vertically
-    split-active-window-horizontally
-    delete-other-windows
-    delete-active-window
-    select-buffer
-    kill-buffer
-    find-file
-    execute-command
-    terminal-resize
-    terminal-copy-mode-on
-    lem-core::<mouse-motion-event>
-    lem-core::<mouse-event>
-    lem/frame-multiplexer:frame-multiplexer-advice))
+;;; Configurations
 
-(define-major-mode terminal-mode ()
-    (:name "Terminal"
-     :keymap *terminal-mode-keymap*)
-  (setf (buffer-read-only-p (current-buffer)) t)
-  (setf (variable-value 'highlight-line :buffer (current-buffer)) nil)
-  (setf (variable-value 'line-wrap :buffer (current-buffer)) nil)
-  (setf (variable-value 'lem/show-paren:enable :buffer (current-buffer)) nil)
-  (add-hook (variable-value 'kill-buffer-hook :buffer (current-buffer)) 'on-kill-buffer)
-  (alexandria:when-let (terminal (get-current-terminal))
-    (terminal:copy-mode-off terminal)))
+;; see `attach-terminal' for implementation
+(declaim (type (or string list) *shell*))
+(defparameter *shell*
+  ;; DEV: for test only
+  '("ls" "-la")
+  
+  ;; TODO: 
+  ;; (or (uiop:getenv "SHELL")
+  ;;     "bash")
+  "The shell of lem terminal. 
+It should be a string or a list of string to create the terminal shell. 
 
-(define-major-mode terminal-copy-mode ()
-    (:name "Terminal (Copy)"
-     :keymap *terminal-copy-mode-keymap*)
-  (setf (buffer-read-only-p (current-buffer)) t)
-  (setf (variable-value 'highlight-line :buffer (current-buffer)) nil)
-  (setf (variable-value 'line-wrap :buffer (current-buffer)) nil)
-  (setf (variable-value 'lem/show-paren:enable :buffer (current-buffer)) nil)
-  (add-hook (variable-value 'kill-buffer-hook :buffer (current-buffer)) 'on-kill-buffer)
-  (alexandria:when-let (terminal (get-current-terminal))
-    (terminal:copy-mode-on terminal)))
+Example: 
 
-(define-key *terminal-mode-keymap* 'self-insert 'terminal-input)
-(define-key *terminal-mode-keymap* 'undefined-key 'terminal-input)
-(define-key *terminal-mode-keymap* "C-h" 'terminal-input)
-(define-key *terminal-mode-keymap* "C-x [" 'terminal-copy-mode-on)
-(define-key *terminal-copy-mode-keymap* "Escape" 'terminal-copy-mode-off)
+    (setf lem-terminal/terminal-mode:*shell* \"zsh\")
+    (setf lem-terminal/terminal-mode:*shell* '(\"screen\" \"bash\"))
+
+By default, the `*shell*' should be the $SHELL env variable,
+or \"bash\". ")
+
+;; see command `terminal' for implementation
+(declaim (type (member :new :reuse) *new-terminal-behavior*))
+(defparameter *new-terminal-behavior* :reuse
+  "How the command `terminal' creates the terminal. 
+
+It should be one of: 
++ `:new': create a new buffer with unique name \"*Terminal*\"
++ `:reuse': reuse existing terminal, aka, switch to 
+  existing buffer named \"*Terminal*\" and ensure it's
+  attached with a living terminal. ")
+
+(declaim (type string *terminal-buffer-name*))
+(defparameter *terminal-buffer-name* "*Terminal*"
+  "Default terminal buffer name. 
+
+The command `terminal' creates terminal buffer with
+`*terminal-buffer-name*' as buffer name. ")
+
+;;; buffer-terminal
+;; A structure with value:
+;; + term
+;; + proc
+;; + thread
+
+(defstruct terminal
+  term
+  proc
+  thread)
+
+;;; Buffer Attributes
 
 (defun buffer-terminal (buffer)
-  (buffer-value buffer 'terminal))
+  "Return the `terminal' object of BUFFER or nil. "
+  (declare (type buffer buffer))
+  (buffer-value buffer 'buffer-terminal))
 
-(defun (setf buffer-terminal) (terminal buffer)
-  (setf (buffer-value buffer 'terminal) terminal))
+(defun buffer-terminal-alive-p (buffer)
+  "Return t if terminal of BUFFER is alive. "
+  (declare (type buffer buffer))
+  (the boolean
+       (when-let ((term (buffer-terminal buffer)))
+         (uiop:process-alive-p (terminal-proc term)))))
 
-(defun make-terminal-buffer (buffer-directory)
-  (declare (type (string) buffer-directory))
-  (let* ((buffer (make-buffer (unique-buffer-name "*Terminal*") :enable-undo-p nil))
-         (terminal (terminal:create :cols 80 :rows 24 :buffer buffer
-                                    :directory buffer-directory)))
-    (setf (buffer-terminal buffer) terminal)
-    (change-buffer-mode buffer 'terminal-mode)
-    buffer))
+;;; Render Terminal to Buffer
 
-(defun on-kill-buffer (buffer)
-  (let ((terminal (buffer-terminal buffer)))
-    (when terminal
-      (terminal:destroy terminal))))
+;; + color<-3bst-color
+;; + attr<-glyph
+;; + move-to-3bst-term
+;; are used as a wrapper of 3bst
 
-(defun create-terminal (buffer-directory)
-  (declare (type (string) buffer-directory))
-  (let* ((buffer (make-terminal-buffer buffer-directory))
-         (window (pop-to-buffer buffer)))
-    (resize-terminal (buffer-terminal buffer) window)
-    (setf (current-window) window)))
+(let ((cache (make-hash-table)))
+  (defun color<-3bst-color (3bst-color)
+    "Turn 3BST-COLOR into Lem color. 
+The color is cached for performance. "
+    (declare (type unsigned-byte 3bst-color))
+    (the color
+         (or (gethash 3bst-color cache)
+             ;; TODO: make terminal color match with theme color
+             ;; or should it be done in `attr<-glyph' function? 
+             (destructuring-bind (r g b) (3bst::color-rgb 3bst-color)
+               (make-color r g b)))))
+  
+  (defun clear-terminal-color-cache ()
+    "Clear `color<-3bst-color' cache. 
+Should be called after `load-theme' command. "
+    (clrhash cache)))
 
-(define-command terminal (always-create-terminal-p) (:universal-nil)
-  (labels ((new-terminal ()
-             (create-terminal (buffer-directory (current-buffer)))))
-    (if always-create-terminal-p
-        (new-terminal)
-        (alexandria:if-let (buffer (terminal:find-terminal-buffer))
-          (setf (current-window) (pop-to-buffer buffer))
-          (new-terminal)))))
+(defun attr<-glyph (glyph)
+  "Turn 3bst::glyph into Lem attribute. 
+Return Lem attribute. "
+  (declare (type 3bst::glyph glyph))
+  (let ((mode (3bst::mode glyph)))
+    (make-attribute :foreground (color<-3bst-color (3bst::fg glyph))
+                    :background (color<-3bst-color (3bst::bg glyph))
+                    :reverse    (logtest 3bst::+attr-reverse+   mode)
+                    :bold       (logtest 3bst::+attr-bold+      mode)
+                    :underline  (logtest 3bst::+attr-underline+ mode))))
 
-(defun get-current-terminal ()
-  (buffer-terminal (current-buffer)))
+(defun move-to-3bst-term (point 3bst-term)
+  "Move POINT to the 3BST-TERM position. "
+  (declare (type point point)
+           (type 3bst:term 3bst-term))
+  (let ((cursor (3bst::cursor 3bst-term)))
+    (move-to-line   point (1+ (3bst::y cursor)))
+    (move-to-column point (1+ (3bst::x cursor)))))
 
-(define-command terminal-input () ()
-  (let ((terminal (get-current-terminal))
-        (keyseq (last-read-key-sequence)))
-    (dolist (key keyseq)
-      (let ((mod (logior (if (key-ctrl key) ffi::vterm_mod_ctrl 0)
-                         (if (key-meta key) ffi::vterm_mod_alt 0)
-                         (if (key-shift key) ffi::vterm_mod_shift 0))))
-        (alexandria:switch ((key-sym key) :test #'equal)
-          ("Return" (terminal:input-key terminal ffi::vterm_key_enter :mod mod))
-          ("Backspace" (terminal:input-key terminal ffi::vterm_key_backspace :mod mod))
-          ("Tab" (terminal:input-key terminal ffi::vterm_key_tab :mod mod))
-          ("Escape" (terminal:input-key terminal ffi::vterm_key_escape :mod mod))
-          ("Up" (terminal:input-key terminal ffi::vterm_key_up :mod mod))
-          ("Down" (terminal:input-key terminal ffi::vterm_key_down :mod mod))
-          ("Left" (terminal:input-key terminal ffi::vterm_key_left :mod mod))
-          ("Right" (terminal:input-key terminal ffi::vterm_key_right :mod mod))
-          ("Insert" (terminal:input-key terminal ffi::vterm_key_ins :mod mod))
-          ("Delete" (terminal:input-key terminal ffi::vterm_key_del :mod mod))
-          ("Home" (terminal:input-key terminal ffi::vterm_key_home :mod mod))
-          ("End" (terminal:input-key terminal ffi::vterm_key_end :mod mod))
-          ("PageUp" (terminal:input-key terminal ffi::vterm_key_pageup :mod mod))
-          ("PageDown" (terminal:input-key terminal ffi::vterm_key_pagedown :mod mod))
-          ("F1" (terminal:input-key terminal (+ 1 ffi::vterm_key_function_0) :mod mod))
-          ("F2" (terminal:input-key terminal (+ 2 ffi::vterm_key_function_0) :mod mod))
-          ("F3" (terminal:input-key terminal (+ 3 ffi::vterm_key_function_0) :mod mod))
-          ("F4" (terminal:input-key terminal (+ 4 ffi::vterm_key_function_0) :mod mod))
-          ("F5" (terminal:input-key terminal (+ 5 ffi::vterm_key_function_0) :mod mod))
-          ("F6" (terminal:input-key terminal (+ 6 ffi::vterm_key_function_0) :mod mod))
-          ("F7" (terminal:input-key terminal (+ 7 ffi::vterm_key_function_0) :mod mod))
-          ("F8" (terminal:input-key terminal (+ 8 ffi::vterm_key_function_0) :mod mod))
-          ("F9" (terminal:input-key terminal (+ 9 ffi::vterm_key_function_0) :mod mod))
-          ("F10" (terminal:input-key terminal (+ 10 ffi::vterm_key_function_0) :mod mod))
-          ("F11" (terminal:input-key terminal (+ 11 ffi::vterm_key_function_0) :mod mod))
-          ("F12" (terminal:input-key terminal (+ 12 ffi::vterm_key_function_0) :mod mod))
-          ("Space" (terminal:input-character terminal #\Space :mod mod))
-          (otherwise
-           (when (= 1 (length (key-sym key)))
-             (terminal:input-character terminal (char (key-sym key) 0) :mod mod))))))))
+;; + terminal-resize
+;; + terminal-render
+;; these are use to control term and buffer rendering
 
-(defmacro define-terminal-key-command (name keyspec vterm-key)
-  (alexandria:with-unique-names (terminal)
-    `(progn
-       (define-key *terminal-mode-keymap* ,keyspec ',name)
-       (define-command ,name () ()
-         (let ((,terminal (get-current-terminal)))
-           (terminal:input-key ,terminal ,vterm-key))))))
+(defun term-resize (terminal window)
+  "Resize TERMINAL to fit WINDOW. "
+  (declare (type terminal terminal)
+           (type window   window))
+  (let ((cols (window-width window))
+        (rows (1- (window-height window)))
+        (term (terminal-term terminal)))
+    ;; resize only when TERMINAL size is different to WINDOW size
+    (unless (and (= cols (3bst::columns term))
+                 (= rows (3bst::rows    term)))
+      (3bst::tresize cols rows :term term))))
 
-(define-terminal-key-command terminal-key-return "Return" ffi::vterm_key_enter)
-(define-terminal-key-command terminal-key-backspace "Backspace" ffi::vterm_key_backspace)
-(define-terminal-key-command terminal-key-tab "Tab" ffi::vterm_key_tab)
-(define-terminal-key-command terminal-key-escape "Escape" ffi::vterm_key_escape)
-(define-terminal-key-command terminal-key-up "Up" ffi::vterm_key_up)
-(define-terminal-key-command terminal-key-down "Down" ffi::vterm_key_down)
-(define-terminal-key-command terminal-key-left "Left" ffi::vterm_key_left)
-(define-terminal-key-command terminal-key-right "Right" ffi::vterm_key_right)
-(define-terminal-key-command terminal-key-insert "Insert" ffi::vterm_key_ins)
-(define-terminal-key-command terminal-key-delete "Delete" ffi::vterm_key_del)
-(define-terminal-key-command terminal-key-home "Home" ffi::vterm_key_home)
-(define-terminal-key-command terminal-key-end "End" ffi::vterm_key_end)
-(define-terminal-key-command terminal-key-pageup "PageUp" ffi::vterm_key_pageup)
-(define-terminal-key-command terminal-key-pagedown "PageDown" ffi::vterm_key_pagedown)
-(define-terminal-key-command terminal-key-f1 "F1" (+ 1 ffi::vterm_key_function_0))
-(define-terminal-key-command terminal-key-f2 "F2" (+ 2 ffi::vterm_key_function_0))
-(define-terminal-key-command terminal-key-f3 "F3" (+ 3 ffi::vterm_key_function_0))
-(define-terminal-key-command terminal-key-f4 "F4" (+ 4 ffi::vterm_key_function_0))
-(define-terminal-key-command terminal-key-f5 "F5" (+ 5 ffi::vterm_key_function_0))
-(define-terminal-key-command terminal-key-f6 "F6" (+ 6 ffi::vterm_key_function_0))
-(define-terminal-key-command terminal-key-f7 "F7" (+ 7 ffi::vterm_key_function_0))
-(define-terminal-key-command terminal-key-f8 "F8" (+ 8 ffi::vterm_key_function_0))
-(define-terminal-key-command terminal-key-f9 "F9" (+ 9 ffi::vterm_key_function_0))
-(define-terminal-key-command terminal-key-f10 "F10" (+ 10 ffi::vterm_key_function_0))
-(define-terminal-key-command terminal-key-f11 "F11" (+ 11 ffi::vterm_key_function_0))
-(define-terminal-key-command terminal-key-f12 "F12" (+ 12 ffi::vterm_key_function_0))
+;; TODO: redraw the buffer line if the row is marked as dirty
+(defun terminal-render (term buffer)
+  "Render TERMINAL on BUFFER. "
+  (declare (type 3bst:term term)
+           (type buffer    buffer))
+  (erase-buffer buffer)
+  (loop :with rows  := (3bst:rows    term)
+        :with cols  := (3bst:columns term)
+        :with point := (buffer-point buffer)
+        
+        :for row :from 0 :below rows
+        :do (progn
+              (loop :with prev-attr := nil
+                    :with string    := ()
 
-(defun adjust-current-point ()
-  (alexandria:if-let ((terminal (get-current-terminal)))
-    (terminal:adjust-point terminal)))
+                    :for col :from 0 :below cols
+                    :for glyph := (3bst:glyph-at (3bst::screen term) row col)
+                    :for chr   := (3bst::c glyph)
+                    :for attr  := (setf prev-attr (attr<-glyph glyph))
+                    :then (attr<-glyph glyph)
 
-(define-command terminal-copy-mode-on () ()
-  (terminal-copy-mode))
+                    :do (progn 
+                          (push chr string)
+                          (unless (attribute-equal prev-attr attr)
+                            (insert-string point
+                                           (concatenate 'string (nreverse string))
+                                           :attribute prev-attr)
+                            (setf prev-attr attr 
+                                  string    ())))
+                    
+                    :finally (insert-string point
+                                            (concatenate 'string (nreverse string))
+                                            :attribute prev-attr))
+              (insert-character point #\Newline))
 
-(define-command terminal-copy-mode-off () ()
-  (terminal-mode)
-  (adjust-current-point))
+        ;; update point position
+        :finally (move-to-3bst-term point term)))
 
-(defmethod execute ((mode terminal-mode) command argment)
-  (if (member command *bypass-commands* :test #'typep)
-      (call-next-method)
-      (terminal-input)))
+;;; Attach Terminal
 
-(defun resize-terminal (terminal window)
-  (terminal:resize terminal
-                   :rows (1- (window-height window))
-                   :cols (window-width window)))
+(defun attach-terminal (buffer &key (directory (or 
+                                                (buffer-directory (current-buffer))
+                                                (uiop:getcwd)))
+                                    (cols      80)
+                                    (rows      40))
+  "Attach BUFFER with a `terminal' value if buffer-terminal is dead. 
 
-(define-command terminal-resize () ()
-  (alexandria:when-let ((terminal (get-current-terminal))
-                        (window (current-window)))
-    (resize-terminal terminal window)))
+If BUFFER terminal is dead ;; (buffer-terminal-alive-p buffer) => nil
+a new terminal would be created and binded with BUFFER.
 
-(defmethod lem-core:paste-using-mode ((mode terminal-mode) string)
-  (let ((terminal (get-current-terminal)))
-    (loop :for c :across string
-          :do (terminal:input-character terminal c))))
+Otherwise, the BUFFER would remain as it is.
 
-(defun on-window-size-change (window)
-  (alexandria:when-let (terminal (buffer-terminal (window-buffer window)))
-    (resize-terminal terminal window)))
+Parameters:
++ BUFFER: the buffer terminal should to be attached
++ DIRECTORY: the directory that `*shell*' process to be lanuched
++ COLS and ROWS: size of created terminal
+"
+  (declare (type buffer buffer))
+  (unless (buffer-terminal-alive-p buffer)
+    ;; the BUFFER should be cleared
+    (erase-buffer buffer)
+    ;; and ROWS of empty lines should be inserted
+    ;; see `terminal-render' and `3bst:dirty'
+    (dotimes (i rows) (newline))
+    (let* ((term (make-instance '3bst:term
+                                :columns cols
+                                :rows    rows))
+           (proc (uiop:with-current-directory (directory)
+                   (uiop:launch-program *shell*
+                                        :input           :stream
+                                        :output          :stream
+                                        :external-format :utf-8)))
+           (out    (uiop:process-info-output proc))
+           (thread (bt:make-thread 
+                    (lambda ()
+                      (loop :for chr = (read-char out nil :eof)
+                            :until (eq chr :eof)
+                            :do (3bst:handle-input (string chr) :term term))))))
+      (setf (buffer-value buffer 'buffer-terminal)
+            (make-terminal :term term :proc proc :thread thread)))))
 
-(add-hook *window-size-change-functions*
-          'on-window-size-change)
+;;; DEV Note:
 
-(add-hook *post-command-hook*
-          'terminal-resize)
+;; the following test code would render ls command output to terminal buffer
+;;
+
+;; (let* ((*shell* '("htop"))
+;;        (buff    (or (get-buffer  *terminal-buffer-name*)
+;;                     (make-buffer *terminal-buffer-name*)))
+;;        (win     (setf (current-window) (pop-to-buffer buff))))
+;;   (attach-terminal buff 
+;;                    :cols (1- (window-width win))
+;;                    :rows (1- (window-height win))
+;;                    :directory #P"~/")
+;;   (bt:make-thread
+;;    (lambda ()
+;;      (loop :while (uiop:process-alive-p (terminal-proc (buffer-terminal buff)))
+;;            :do (send-event 
+;;                 (lambda () 
+;;                   (terminal-render (terminal-term (buffer-terminal buff)) buff)
+;;                   (redraw-display)))
+;;            :do (sleep 1.0)
+;;            :finally (uiop:terminate-process (terminal-proc (buffer-terminal buff)))))))
+
+;;; TODO: Commands
+
+;;; Hooks
+
+;; (add-hook *after-load-theme-hook* 'clear-terminal-color-cache)
+
+;;;; terminal-mode.lisp ends here

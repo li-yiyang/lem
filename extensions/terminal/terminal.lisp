@@ -13,7 +13,7 @@
            :input-character
            :input-key
            :resize
-           :adjust-point))
+          :adjust-point))
 (in-package :lem-terminal/terminal)
 
 ;;; id generator
